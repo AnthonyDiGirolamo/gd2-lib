@@ -42,6 +42,29 @@
 #define SDCARD 0
 #endif
 
+// Uncomment this line to use the SdFat library
+// instead of GD2 built-in sdcard support.
+// More info at: https://github.com/greiman/SdFat
+
+#define USE_SDFAT
+
+// To use Sdio or SdioEX on Teensy 3.5/3.6 add this to your sketch.
+//
+//   #include "SdFat.h"
+//
+//   SdFatSdioEX sdfat; // OR: SdFatSdio sdfat;
+//
+//   void setup() {
+//     if (!sdfat.begin())
+//       sdfat.initErrorHalt("SdFatSdioEX begin() failed");
+//     sdfat.chvol(); // make sdEx the current volume.
+//     GD.begin();
+//   }
+
+#ifdef USE_SDFAT
+#include "SdFat.h"
+#endif
+
 #if defined(__DUE__)
 #define MOSI  11
 #define MISO  12
@@ -101,6 +124,7 @@ static class ASPI_t ASPI;
 
 #if defined(VERBOSE) && (VERBOSE > 0)
 #define INFO(X) Serial.println((X))
+#define INFO_NO_CR(X) Serial.print((X))
 #if defined(RASPBERRY_PI)
 #define REPORT(VAR) fprintf(stderr, #VAR "=%d\n", (VAR))
 #else
@@ -108,6 +132,7 @@ static class ASPI_t ASPI;
 #endif
 #else
 #define INFO(X)
+#define INFO_NO_CR(X)
 #define REPORT(X)
 #endif
 
@@ -1301,6 +1326,93 @@ public:
 class MoviePlayer
 {
   uint32_t mf_size, mf_base, wp;
+  #ifdef USE_SDFAT
+  int lastfd;
+  byte buf[512];
+
+  File file;
+  void loadsector() {
+    uint16_t readsize;
+    readsize = file.read(buf, 512);
+    if (readsize < 0) {
+      INFO("failed to read");
+    }
+    INFO_NO_CR("  file read: ");
+    INFO_NO_CR(readsize);
+    INFO_NO_CR(" bytes  ");
+    INFO_NO_CR("wp = ");
+    INFO_NO_CR(wp);
+    INFO_NO_CR(" copy... ");
+    GD.cmd_memwrite(mf_base + wp, 512);
+    GD.copy(buf, 512);
+    wp = (wp + 512) % mf_size;
+    INFO_NO_CR("done! -> new_wp = ");
+    INFO(wp);
+  }
+
+public:
+  int begin(const char *filename) {
+    lastfd=0;
+    INFO("MovePlayer.begin() start");
+    GD.__end();
+    mf_size = 0x43800UL;
+    mf_base = 0x100000UL - mf_size;
+    if(!file.open(filename, O_READ)) {
+      INFO("Open failed");
+      return 0;
+    }
+    INFO_NO_CR("File size: "); INFO(file.fileSize());
+    GD.resume();
+
+    INFO("initial loadsectors fill mediafifo");
+    wp = 0;
+    while (wp < (mf_size - 512)) {
+      loadsector();
+    }
+
+    INFO("GD.cmd_mediafifo");
+    GD.cmd_mediafifo(mf_base, mf_size);
+    INFO("GD.regwrite");
+    GD.cmd_regwrite(REG_MEDIAFIFO_WRITE, wp);
+    INFO("GD.finish");
+    GD.finish();
+
+    INFO("MovePlayer.begin() finish");
+    return 1;
+  }
+  int service() {
+    if (!file.available()) {
+      file.close();
+      return 0;
+    } else {
+      uint32_t current_reg_mediafifo_read = GD.rd32(REG_MEDIAFIFO_READ);
+      uint32_t current_reg_mediafifo_write = GD.rd32(REG_MEDIAFIFO_WRITE);
+      uint32_t fullness = (wp - current_reg_mediafifo_read) % mf_size;
+      int freespace = mf_size - fullness;
+      int fd = freespace;
+      if (fd != lastfd) {
+        INFO_NO_CR("reg_mediafifo_read = ");
+        INFO_NO_CR(current_reg_mediafifo_read);
+        INFO_NO_CR("  reg_mediafifo_write = ");
+        INFO_NO_CR(current_reg_mediafifo_write);
+        INFO_NO_CR("  freespace = ");
+        INFO(fd);
+        Serial.flush();
+      }
+      lastfd = fd;
+
+      while (freespace >= 512) {
+        loadsector();
+        freespace -= 512;
+        GD.wr32(REG_MEDIAFIFO_WRITE, wp);
+      }
+
+
+      return 1;
+    }
+  }
+  #else
+
   Reader r;
   void loadsector() {
     byte buf[512];
@@ -1348,6 +1460,7 @@ public:
       return 1;
     }
   }
+  #endif
   void play() {
     GD.cmd_playvideo(OPT_MEDIAFIFO | OPT_FULLSCREEN);
     GD.flush();
